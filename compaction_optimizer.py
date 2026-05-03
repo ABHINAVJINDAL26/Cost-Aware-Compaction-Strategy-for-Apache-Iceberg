@@ -1,20 +1,28 @@
 """Cost-aware compaction optimizer for Apache Iceberg partitions.
 
-The script is intentionally dependency-light so it can run in a minimal
-environment. It reads a JSON array of partition records, computes a
-performance-penalty proxy and a compaction cost, then solves the budgeted
-selection problem with an exact 0/1 knapsack dynamic program.
+Reads a JSON array of partition records, computes a performance-penalty proxy
+and a compaction cost, then solves the budgeted selection problem with either:
+  - exact  : 0/1 knapsack dynamic programming (globally optimal)
+  - greedy : efficiency-ratio ranking (fast baseline)
 
-Expected input schema per partition:
+Usage
+-----
+python compaction_optimizer.py --input data/partitions.json --mode exact \
+    --output-json outputs/summary.json \
+    --output-csv  outputs/selected.csv \
+    --output-plot outputs/results_chart.png
+
+Expected input schema (one object per partition)::
+
     {
-        "partition_id": "p_001",
-        "file_count": 120,
-        "avg_file_size_mb": 45.2,
-        "delete_file_count": 30,
-        "delete_ratio": 0.25,
-        "avg_delete_file_size_mb": 12.5,
+        "partition_id"              : "p_001",
+        "file_count"                : 120,
+        "avg_file_size_mb"          : 45.2,
+        "delete_file_count"         : 30,
+        "delete_ratio"              : 0.25,
+        "avg_delete_file_size_mb"   : 12.5,
         "partition_access_frequency": 85,
-        "small_files_count": 95
+        "small_files_count"         : 95
     }
 """
 
@@ -23,11 +31,13 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Sequence
 
-from src.visualize import save_basic_report_plot
+from src.penalty import PartitionMetrics
+from src.selector import enrich_partitions, greedy_selection
+from src.visualize import save_basic_report_plot, save_full_report_plot
 
 
 DEFAULT_BUDGET_MINUTES = 3000.0
@@ -35,26 +45,6 @@ DEFAULT_COST_FACTOR = 0.001
 DEFAULT_DELETE_RATIO_THRESHOLD = 0.20
 DEFAULT_TARGET_FILE_SIZE_MB = 128.0
 DEFAULT_SMALL_FILE_THRESHOLD_MB = 128.0
-EPSILON = 1e-9
-
-
-@dataclass
-class PartitionMetrics:
-    partition_id: str
-    file_count: int
-    avg_file_size_mb: float
-    delete_file_count: int
-    delete_ratio: float
-    avg_delete_file_size_mb: float
-    partition_access_frequency: float
-    small_files_count: int
-    small_file_pressure: float = 0.0
-    delete_pressure: float = 0.0
-    access_weight: float = 0.0
-    penalty: float = 0.0
-    compaction_cost: float = 0.0
-    efficiency_score: float = 0.0
-    threshold_signal: bool = False
 
 
 def _require_field(row: dict[str, Any], field: str) -> Any:
@@ -101,80 +91,6 @@ def load_partitions(input_path: Path) -> list[PartitionMetrics]:
         )
 
     return partitions
-
-
-def enrich_metrics(
-    partitions: Sequence[PartitionMetrics],
-    *,
-    cost_factor: float = DEFAULT_COST_FACTOR,
-    delete_ratio_threshold: float = DEFAULT_DELETE_RATIO_THRESHOLD,
-    target_file_size_mb: float = DEFAULT_TARGET_FILE_SIZE_MB,
-    small_file_threshold_mb: float = DEFAULT_SMALL_FILE_THRESHOLD_MB,
-) -> list[PartitionMetrics]:
-    if not partitions:
-        return []
-
-    max_access_frequency = max(p.partition_access_frequency for p in partitions) or 1.0
-    enriched: list[PartitionMetrics] = []
-
-    for partition in partitions:
-        small_file_pressure = partition.small_files_count / max(partition.avg_file_size_mb, EPSILON)
-        delete_pressure = partition.delete_file_count * partition.avg_delete_file_size_mb
-        access_weight = partition.partition_access_frequency / max_access_frequency
-
-        # The penalty is a proxy for query-time degradation.
-        penalty = (small_file_pressure + delete_pressure) * (1.0 + access_weight)
-
-        compaction_cost = (
-            partition.file_count
-            * partition.avg_file_size_mb
-            * partition.avg_delete_file_size_mb
-            * cost_factor
-        )
-        if compaction_cost <= 0:
-            compaction_cost = EPSILON
-
-        threshold_signal = (
-            partition.delete_ratio >= delete_ratio_threshold
-            or partition.avg_file_size_mb < target_file_size_mb
-            or partition.avg_file_size_mb < small_file_threshold_mb
-            or partition.small_files_count > 0
-        )
-        efficiency_score = penalty / compaction_cost
-        if threshold_signal:
-            efficiency_score *= 1.10
-
-        payload = asdict(partition)
-        payload.update(
-            small_file_pressure=small_file_pressure,
-            delete_pressure=delete_pressure,
-            access_weight=access_weight,
-            penalty=penalty,
-            compaction_cost=compaction_cost,
-            efficiency_score=efficiency_score,
-            threshold_signal=threshold_signal,
-        )
-
-        enriched.append(
-            PartitionMetrics(**payload)
-        )
-
-    return enriched
-
-
-def greedy_selection(partitions: Sequence[PartitionMetrics], budget_minutes: float) -> tuple[list[PartitionMetrics], float, float]:
-    ranked = sorted(partitions, key=lambda item: (item.efficiency_score, item.penalty), reverse=True)
-    selected: list[PartitionMetrics] = []
-    total_cost = 0.0
-    total_gain = 0.0
-
-    for partition in ranked:
-        if total_cost + partition.compaction_cost <= budget_minutes:
-            selected.append(partition)
-            total_cost += partition.compaction_cost
-            total_gain += partition.penalty
-
-    return selected, total_cost, total_gain
 
 
 def exact_knapsack_selection(
@@ -250,6 +166,7 @@ def build_summary(
     all_partitions: Sequence[PartitionMetrics],
     selected_partitions: Sequence[PartitionMetrics],
     budget_minutes: float,
+    mode: str,
 ) -> dict[str, Any]:
     selected_ids = {partition.partition_id for partition in selected_partitions}
     skipped_partitions = [partition for partition in all_partitions if partition.partition_id not in selected_ids]
@@ -258,6 +175,7 @@ def build_summary(
     total_gain = sum(partition.penalty for partition in selected_partitions)
 
     return {
+        "mode": mode,
         "budget_minutes": budget_minutes,
         "selected_count": len(selected_partitions),
         "skipped_count": len(skipped_partitions),
@@ -292,15 +210,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
     partitions = load_partitions(input_path)
-    enriched_partitions = enrich_metrics(partitions)
+    enriched_partitions = enrich_partitions(partitions)
 
     if args.mode == "greedy":
         selected_partitions, total_cost, total_gain = greedy_selection(enriched_partitions, args.budget_minutes)
     else:
         selected_partitions, total_cost, total_gain = exact_knapsack_selection(enriched_partitions, args.budget_minutes)
 
-    summary = build_summary(enriched_partitions, selected_partitions, args.budget_minutes)
-    summary["mode"] = args.mode
+    summary = build_summary(enriched_partitions, selected_partitions, args.budget_minutes, args.mode)
     summary["total_cost_minutes"] = round(total_cost, 4)
     summary["expected_performance_gain"] = round(total_gain, 4)
 
@@ -316,11 +233,27 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.output_plot:
         plot_path = Path(args.output_plot)
+        selected_ids = {partition.partition_id for partition in selected_partitions}
+        statuses = [
+            "Selected" if partition.partition_id in selected_ids else "Skipped"
+            for partition in enriched_partitions
+        ]
+        save_full_report_plot(
+            partition_ids=[partition.partition_id for partition in enriched_partitions],
+            penalties=[partition.penalty for partition in enriched_partitions],
+            costs=[partition.compaction_cost for partition in enriched_partitions],
+            efficiency_scores=[partition.efficiency_score for partition in enriched_partitions],
+            statuses=statuses,
+            total_cost=total_cost,
+            budget_minutes=args.budget_minutes,
+            output_path=plot_path,
+        )
+    else:
         save_basic_report_plot(
             [partition.partition_id for partition in enriched_partitions],
             [partition.penalty for partition in enriched_partitions],
             [partition.compaction_cost for partition in enriched_partitions],
-            plot_path,
+            Path("outputs/results_chart.png"),
         )
 
     return 0
