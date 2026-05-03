@@ -1,7 +1,6 @@
 # Cost-Aware Compaction Strategy for Apache Iceberg
 
-This repository contains a complete solution for the Datazip assignment on budgeted compaction planning.
-The task is to decide which Iceberg partitions should be compacted so that query performance improves as much as possible while staying within a daily compute budget of 3000 minutes.
+An optimizer to decide which partitions in an Apache Iceberg table should be compacted to maximize query performance improvement while staying within a 3000-minute daily compute budget.
 
 ## Problem Summary
 
@@ -193,17 +192,11 @@ That means every partition fits within the daily budget under the current scorin
 - `src/visualize.py` saves the final chart image.
 - The root script remains the main entrypoint so the project is easy to run from the command line.
 
-## Deliverables Covered
+## What's Included
 
-This repository covers all required parts of the assignment:
-
-- optimization model design
-- cost model
-- selection logic
-- simulation code
-- output summary
-- visualization for presentation use
-
-## Recommendation
-
-If you submit this as a project, use `README.md` as the final source of truth. The older `README (9).md` has been removed after merging its useful content here.
+- Optimization model with penalty and cost calculations
+- 0/1 knapsack exact solver plus greedy baseline
+- Full data pipeline with typed partition objects
+- 4-panel visualization with status indicators
+- JSON, CSV, and image outputs
+- Complete source code and test dataset
